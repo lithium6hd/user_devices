@@ -10,6 +10,7 @@
 #####################################################################
 
 import time
+import threading
 from datetime import datetime
 import sys
 import numpy as np
@@ -197,14 +198,68 @@ class ADwinProIIWorker(Worker):
     def transition_to_manual(self):
         self.logger.debug("ADwin called transition_to_manual.")
         start = time.perf_counter()
-        # Get AIN measurements from ADwin
-        with h5py.File(self.h5file,'r+') as f:
-            AI_count = f[f"devices/{self.device_name}/ANALOG_IN"].attrs["AIN_count"]
+
+        # Step 1: read everything needed from the h5 file, then release the lock.
+        # The lock must NOT be held while making ADwin hardware calls — those can
+        # block indefinitely, and holding the lock would deadlock any other process
+        # that needs the file (e.g. lyse, BLACS queue_manager).
+        with h5py.File(self.h5file, 'r') as f:
+            AI_count = int(f[f"devices/{self.device_name}/ANALOG_IN"].attrs["AIN_count"])
+            has_waits = f[f"devices/{self.device_name}"].attrs.get("wait_time", None) is not None
+            if has_waits:
+                wait_table      = f["waits"]
+                wait_labels     = wait_table['label'][:]
+                wait_times      = wait_table['time'][:]
+                wait_timeouts   = wait_table['timeout'][:]
+
+        # Step 2: ADwin hardware calls with a hard timeout so a hung ADwin does
+        # not freeze BLACS.  The file lock is not held here.
+        adwin_data = {}
+        exc_box = [None]
+
+        def _adwin_calls():
+            try:
+                if AI_count > 0:
+                    adwin_data['AIN'] = np.ctypeslib.as_array(
+                        self.adw.GetData_Long(199, 1, AI_count)
+                    ).astype(np.uint16)
+                if has_waits:
+                    adwin_data['wait_duration'] = self.adw.Get_Par(4) / CLOCK_T12 * self.PROCESSDELAY
+                # Check if the TiCo processes were running correctly
+                for name, num in self.DIO_ADwin_DataNo:
+                    if num == 50: # TODO: Fix in Adbasic
+                        num = 20
+                    if not self.adw.Get_Par(num) == 1:
+                        exc_box[0] = LabscriptError(
+                            f"TiCo process of module {name} was not running before at end main process."
+                        )
+                        return
+                # Stop buffered and start manual process in ADwin
+                self.adw.Stop_Process(self.process_number_buffered)
+                #self.adw.Start_Process(self.process_number_manual)
+            except Exception as e:
+                exc_box[0] = e
+
+        _TIMEOUT = 30  # seconds; normal ADwin calls finish in <1 s
+        t = threading.Thread(target=_adwin_calls, daemon=True)
+        t.start()
+        t.join(_TIMEOUT)
+        if t.is_alive():
+            # The orphaned thread holds no file lock, so BLACS can recover safely.
+            raise LabscriptError(
+                f"ADwin transition_to_manual timed out after {_TIMEOUT} s — "
+                "hardware communication is hung. Restart BLACS to recover."
+            )
+        if exc_box[0] is not None:
+            raise exc_box[0]
+
+        # Step 3: write ADwin results back to the h5 file (fast, no hardware calls).
+        with h5py.File(self.h5file, 'r+') as f:
             group = f.require_group("data/traces/")
-            # Read Analog In data from ADwin
-            if AI_count>0:
-                AIN_data = np.ctypeslib.as_array(self.adw.GetData_Long(199,1,int(AI_count))).astype(np.uint16)
-                group.create_dataset("ADwinAnalogIn_DATA", compression = config.compression, data = AIN_data)
+            if AI_count > 0:
+                group.create_dataset(
+                    "ADwinAnalogIn_DATA", compression=config.compression, data=adwin_data['AIN']
+                )
             # Workload for Testing
             # stop_time = self.adw.Get_Par(2)-1
             # workload_data = np.ctypeslib.as_array(self.adw.GetData_Long(31,1,stop_time))
@@ -213,30 +268,20 @@ class ADwinProIIWorker(Worker):
             # array["values"] = workload_data
             # group.create_dataset("ADwin_Workload", compression = config.compression, data = array)
             # f['devices/ADwin/ANALOG_IN'].attrs["ADwin_Workload"] = "TEST"
-
-            # Get wait duration
-            if f[f"devices/{self.device_name}"].attrs.get("wait_time", None) is not None:
-                wait_duration = self.adw.Get_Par(4) / CLOCK_T12 * self.PROCESSDELAY
-                wait_table = f["waits"]
-                dtypes = [('label', 'a256'),('time', float),('timeout', float),('duration', float),('timed_out', bool)]
-                data = np.empty(len(wait_table), dtype=dtypes)
-                data['label'] = wait_table['label']
-                data['time'] = wait_table['time']
-                data['timeout'] = wait_table['timeout']
-                data['duration'] = wait_duration
-                data['timed_out'] = wait_duration > wait_table['timeout']
+            if has_waits:
+                wait_duration = adwin_data['wait_duration']
+                dtypes = [('label', 'a256'), ('time', float), ('timeout', float),
+                          ('duration', float), ('timed_out', bool)]
+                data = np.empty(len(wait_labels), dtype=dtypes)
+                data['label']     = wait_labels
+                data['time']      = wait_times
+                data['timeout']   = wait_timeouts
+                data['duration']  = wait_duration
+                data['timed_out'] = wait_duration > wait_timeouts
                 f.create_dataset('/data/waits', data=data)
-        # Delete h5file from worker, shot is finished
+
+        # Delete h5file reference from worker, shot is finished
         self.h5file = None
-        # Check if the TiCo processes were running correctly
-        for name,num in self.DIO_ADwin_DataNo:
-            if num == 50: # TODO: Fix in Adbasic
-                num = 20
-            if not self.adw.Get_Par(num)==1:
-                raise LabscriptError(f"TiCo process of module {name} was not running before at end main process.")
-        # Stop buffered and start manual process in ADwin
-        self.adw.Stop_Process(self.process_number_buffered)
-        #self.adw.Start_Process(self.process_number_manual)
         print(f"Time for transition_to_manual: {time.perf_counter()-start:.3f}s")
         return True
 
@@ -276,6 +321,8 @@ class ADwinProIIWorker(Worker):
                     # If we use the process without PIDs in manual mode, those data arrays are not initialized.
                     print("program_manual failed to send values for PIDs in manual mode.")
             else:                                   # Digital output
+                if module == 5:
+                    module = 2
                 self.adw.Set_Par(90+module,module_data)
         # Set parameter that the output channels are updated in ADwin.
         self.adw.Set_Par(11,1)

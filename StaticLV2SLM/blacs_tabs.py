@@ -39,3 +39,4 @@ class StaticLV2SLMTab(DeviceTab):
 
         self.supports_remote_value_check(False)
         self.supports_smart_programming(True)
+        # self.supports_buffered_skip(True)
