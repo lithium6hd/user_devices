@@ -306,10 +306,21 @@ class Aravis_Camera(object):
 
         Uses ArvCamera's one-shot helper, which manages a stream of its own;
         it does not need, and does not touch, self.stream.
+
+        Passes a real timeout (derived from GRAB_TIMEOUT_S) rather than 0:
+        0 means an untimed wait, and a camera left in TriggerMode='On' with
+        no trigger arriving would otherwise wedge this call, and the worker
+        with it, indefinitely.
         """
-        buffer = self.camera.acquisition(0)
+        buffer = self.camera.acquisition(int(self.GRAB_TIMEOUT_S * 1_000_000))
         if buffer is None:
-            raise RuntimeError("failed to acquire an image")
+            raise RuntimeError(
+                f"acquisition timed out after {self.GRAB_TIMEOUT_S}s waiting "
+                f"for an image. If the camera is left in TriggerMode='On' "
+                f"with no trigger arriving, this is expected: switch to "
+                f"manual mode (which applies manual_mode_camera_attributes) "
+                f"or provide a trigger."
+            )
         return self._buffer_to_array(buffer)
 
     #: Overall time budget for grab(), in seconds. IMAQdxCameraWorker's
@@ -346,7 +357,10 @@ class Aravis_Camera(object):
         try:
             status = buffer.get_status()
             if status != Aravis.BufferStatus.SUCCESS:
-                raise RuntimeError(f"buffer received with status {status}")
+                raise RuntimeError(
+                    f"buffer received with status "
+                    f"{getattr(status, 'value_nick', status)!r}"
+                )
             return self._buffer_to_array(buffer)
         finally:
             # Every popped buffer goes back to the pool, on every path. A
@@ -378,7 +392,8 @@ class Aravis_Camera(object):
                     if status != Aravis.BufferStatus.SUCCESS:
                         msg = (
                             f"image {i + 1} of {n_images} received with "
-                            f"buffer status {status}"
+                            f"buffer status "
+                            f"{getattr(status, 'value_nick', status)!r}"
                         )
                         if self.exception_on_failed_shot:
                             raise RuntimeError(msg)
@@ -396,10 +411,20 @@ class Aravis_Camera(object):
         print(f"Got {len(images)} of {n_images} images.")
 
     def stop_acquisition(self):
-        """Stop acquisition and release the stream and its buffers."""
-        self.camera.stop_acquisition()
-        # Dropping the stream reference frees its buffers.
-        self.stream = None
+        """Stop acquisition and release the stream and its buffers.
+
+        self.stream = None happens in a finally so that a raising
+        self.camera.stop_acquisition() (e.g. an unplugged camera) still
+        clears the stream. configure_acquisition() calls stop_acquisition()
+        whenever self.stream is not None, so leaving it set on a raise would
+        make every subsequent configure_acquisition() re-raise the same
+        failure instead of recovering.
+        """
+        try:
+            self.camera.stop_acquisition()
+        finally:
+            # Dropping the stream reference frees its buffers.
+            self.stream = None
 
     def abort_acquisition(self):
         """Ask a running grab_multiple to return early. Safe from any thread."""
@@ -458,3 +483,37 @@ class AravisCameraWorker(IMAQdxCameraWorker):
                 f"readable but raised on read: {preview}{suffix}"
             )
         return attributes
+
+    def get_attributes_as_text(self, visibility_level):
+        """Return a string of the camera's *writeable* attributes, formatted
+        for copying and pasting into a connection table's camera_attributes.
+
+        Overrides the base implementation, which lists every readable
+        attribute -- it calls
+        ``self.camera.get_attribute_names(visibility_level)``, whose default
+        ``writeable_only=False`` matches ``get_attribute_names``'s own
+        default. ``IMAQdxCameraWorker``'s docstring says this text is meant
+        to be "appropriate for copying and pasting into your connection
+        table", but on this FLIR Blackfly S, 88 of the 193
+        ``'intermediate'``-visibility names are read-only. Pasting the base
+        output into ``camera_attributes`` makes ``set_attribute`` raise on
+        each read-only name, ``apply_with_retry`` re-raise after the retry
+        pass also fails, and the worker fail inside ``init()`` -- so the tab
+        never starts.
+
+        Restricting to ``writeable_only=True`` keeps the output paste-safe.
+        This does not affect ``get_attributes_as_dict``, which is left as
+        overridden above: the richer read-only data (temperatures, device
+        identity, chunk/event features) is genuinely wanted in the shot
+        file, just not in a dict meant to be pasted back in as input.
+
+        The output format is unchanged from the base implementation; only
+        the set of names differs.
+        """
+        names = self.camera.get_attribute_names(
+            visibility_level, writeable_only=True
+        )
+        attrs = {name: self.camera.get_attribute(name) for name in names}
+        lines = [f'    {repr(key)}: {repr(value)},' for key, value in attrs.items()]
+        dict_repr = '\n'.join(['{'] + lines + ['}'])
+        return self.device_name + '_camera_attributes = ' + dict_repr
