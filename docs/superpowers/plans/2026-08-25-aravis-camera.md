@@ -1719,11 +1719,61 @@ class AravisCameraWorker(IMAQdxCameraWorker):
     """BLACS worker for Aravis cameras.
 
     All buffered-shot logic, HDF5 output and image transport are inherited;
-    only the camera interface class differs.
+    only the camera interface class and the attribute snapshot differ.
     """
 
     interface_class = Aravis_Camera
+
+    def get_attributes_as_dict(self, visibility_level):
+        """Return a dict of readable attributes at the given visibility level.
+
+        Overrides the base implementation, which builds this dict with an
+        unguarded comprehension:
+
+            {name: self.camera.get_attribute(name) for name in names}
+
+        Some GenICam features are advertised as readable but raise when
+        actually read outside acquisition. On this FLIR Blackfly S, 26 of the
+        Chunk*/Event* family do exactly that, and they appear at
+        ``'intermediate'`` -- which is the DEFAULT
+        ``saved_attribute_visibility_level``. Since
+        ``transition_to_buffered`` calls this to snapshot attributes into the
+        shot file, the base implementation aborts every buffered shot on a
+        stock configuration.
+
+        No static predicate distinguishes these features: ``is_available``,
+        ``is_implemented`` and the access mode all report them as readable.
+        The only reliable test is to read and skip what fails.
+        """
+        attributes = {}
+        skipped = []
+        for name in self.camera.get_attribute_names(visibility_level):
+            try:
+                attributes[name] = self.camera.get_attribute(name)
+            except Exception:
+                skipped.append(name)
+        if skipped:
+            preview = ', '.join(skipped[:5])
+            suffix = ', ...' if len(skipped) > 5 else ''
+            print(
+                f"Skipped {len(skipped)} attribute(s) that are advertised as "
+                f"readable but raised on read: {preview}{suffix}"
+            )
+        return attributes
 ```
+
+**Why this override is required (verified on hardware, 2026-08-25):**
+
+| visibility level | features listed | of those, raise on read |
+|---|---|---|
+| `simple` | 57 | 0 |
+| `intermediate` | 193 | **26** |
+| `advanced` | 223 | **26** |
+
+The failing set is the `Chunk*`/`Event*` family (`ChunkImage`, `ChunkCRC`,
+`ChunkFrameID`, `ChunkOffsetX`, ...). Because `'intermediate'` is the default,
+omitting this override means the first buffered shot fails inside
+`transition_to_buffered` before acquisition is even configured.
 
 - [ ] **Step 2: Write the BLACS tab**
 

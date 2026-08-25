@@ -144,8 +144,12 @@ tmpfiles proves unreliable.
 
 - **Serial numbers change, and their interpretation changes too.** The
   connection table's `1E1001551991` is IMAQdx's vendor-prefixed *hex* format.
-  Aravis reports the GenICam `DeviceSerialNumber`, which for FLIR is a plain
-  decimal string. Re-read real values with `arv-tool-0.8`. A serial-not-found
+  Aravis reports the GenICam `DeviceSerialNumber`, an opaque string. Do not
+  assume it is decimal: the camera on this bench reports `0159787F`, which
+  contains hex letters, so `int(serial, 16)` SUCCEEDS on it and silently
+  returns 22640767 rather than raising. That is precisely the silent
+  misidentification the override prevents. Re-read real values with
+  `arv-tool-0.8`. A serial-not-found
   error lists every serial actually detected, so discovery can happen from
   inside BLACS. See "Serial number handling" for why this requires an
   `__init__` override rather than being a documentation-only concern.
@@ -570,9 +574,9 @@ production `HQA` table.
 | 0. `aravis_smoke_test.py` | Aravis + camera | Aravis alone, outside labscript entirely |
 | 1. `mock=True` | Nothing connected | Registration, BLACS tab, h5 layout, lyse access |
 | 2. `serial_number='Fake_1'` | Aravis installed | The real binding: discovery, typed attribute get/set, streaming, buffer→numpy |
-| 3. Firefly, manual mode | Camera + udev/usbfs | Enumeration by serial, live snap, feature read/write, continuous view |
-| 4. Firefly, free-run buffered shot | Camera only, **no trigger wire** | The whole buffered path end-to-end |
-| 5. Firefly, hardware-triggered shot | **Blocked — not wired** | Trigger timing only |
+| 3. Blackfly S, manual mode | Camera + udev/usbfs | Enumeration by serial, live snap, feature read/write, continuous view |
+| 4. Blackfly S, free-run buffered shot | Camera only, **no trigger wire** | The whole buffered path end-to-end |
+| 5. Blackfly S, hardware-triggered shot | **Blocked — not wired** | Trigger timing only |
 
 Tiers 0–2 need no camera-specific hardware setup at all, so implementation can
 proceed and be largely validated before touching udev or usbfs.
