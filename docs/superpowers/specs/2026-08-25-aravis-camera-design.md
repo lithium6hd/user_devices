@@ -142,11 +142,13 @@ tmpfiles proves unreliable.
 
 ## Migration notes
 
-- **Serial numbers change.** The connection table's `1E1001551991` is IMAQdx's
-  vendor-prefixed format. Aravis reports the GenICam `DeviceSerialNumber`,
-  which for FLIR is the plain decimal serial. Re-read real values with
-  `arv-tool-0.8`. To make this painless, a serial-not-found error lists every
-  serial actually detected.
+- **Serial numbers change, and their interpretation changes too.** The
+  connection table's `1E1001551991` is IMAQdx's vendor-prefixed *hex* format.
+  Aravis reports the GenICam `DeviceSerialNumber`, which for FLIR is a plain
+  decimal string. Re-read real values with `arv-tool-0.8`. A serial-not-found
+  error lists every serial actually detected, so discovery can happen from
+  inside BLACS. See "Serial number handling" for why this requires an
+  `__init__` override rather than being a documentation-only concern.
 - **Attribute names lose their category prefixes.** IMAQdx presents GenICam
   features as `Category::Feature`; Aravis uses bare names. `camera_attributes`
   accepts **bare GenICam names only** — no prefix stripping, no category map.
@@ -167,18 +169,61 @@ userlib/user_devices/AravisCamera/
 ├── blacs_workers.py               # Aravis_Camera + AravisCameraWorker
 ├── register_classes.py            # registers the tab
 └── testing/
-    └── aravis_smoke_test.py       # standalone, runs outside BLACS
+    ├── aravis_smoke_test.py       # standalone, runs outside BLACS
+    └── connection_table_aravis_test.py   # minimal all-dummy test table
 ```
 
 ### `labscript_devices.py`
 
-`AravisCamera(IMAQdxCamera)` overriding only `description = 'Aravis GenICam
-Camera'`. It inherits the full signature — `serial_number`, `orientation`,
-`pixel_size`, `magnification`, `trigger_edge_type`, `trigger_duration`,
+`AravisCamera(IMAQdxCamera)` overriding `description = 'Aravis GenICam Camera'`
+and `__init__` (see "Serial number handling" below — this is the one place the
+base class is actively wrong for Aravis).
+
+It keeps the full signature — `serial_number`, `orientation`, `pixel_size`,
+`magnification`, `trigger_edge_type`, `trigger_duration`,
 `minimum_recovery_time`, `camera_attributes`, `manual_mode_camera_attributes`,
 `stop_acquisition_timeout`, `exception_on_failed_shot`,
 `saved_attribute_visibility_level`, `mock`. No new parameters: everything
 Aravis needs is expressible as GenICam attributes.
+
+### Serial number handling
+
+`IMAQdxCamera.__init__` contains:
+
+```python
+if isinstance(serial_number, (str, bytes)):
+    serial_number = int(serial_number, 16)
+self.serial_number = serial_number
+self.BLACS_connection = hex(self.serial_number)[2:].upper()
+```
+
+**String serial numbers are parsed as hexadecimal.** That is correct for
+IMAQdx, whose serials genuinely are hex (hence `1E1001551991` in the existing
+connection table). Aravis reports the GenICam `DeviceSerialNumber`, an opaque
+string that for FLIR is **decimal**. Inheriting this behaviour would silently
+reinterpret `"15551991"` as hex — a different number, with no error raised, and
+a BLACS tab labelled with a meaningless value.
+
+`AravisCamera` therefore overrides `__init__`: it stores `serial_number`
+verbatim as a string, sets `BLACS_connection` to that same string so the BLACS
+tab shows the real serial, replicates the remaining ~20 lines of
+`IMAQdxCamera.__init__` validation (the `manual_mode_camera_attributes` subset
+check and the `saved_attribute_visibility_level` check), and calls
+`TriggerableDevice.__init__` directly.
+
+This is deliberately an explicit override rather than a post-hoc fixup of
+`self.serial_number` after calling `super().__init__()`. Both `IMAQdxCamera`
+and any override are decorated with `@set_passed_properties`, and relying on
+which decorator's captured value ultimately lands in
+`connection_table_properties` would be fragile. The duplicated validation is
+stable upstream code and the override is explicit about what it changes.
+
+The worker compares serials as strings against
+`Aravis.get_device_serial_nbr(i)`, so no further conversion is needed.
+
+*Passing an `int` would coincidentally work* — the hex branch only triggers for
+`str`/`bytes` — but it produces a nonsensical `BLACS_connection` and breaks for
+vendors with alphanumeric serials. It is not the chosen approach.
 
 ### `register_classes.py`
 
@@ -439,26 +484,111 @@ must name this symptom explicitly.
 
 ## Testing
 
-**Constraint: the camera is not wired to a parent device for triggering.**
-Hardware-triggered shots therefore cannot be validated in this work.
+**Constraints.** Two, both hard:
+
+1. The camera is not wired to a parent device for triggering, so
+   hardware-triggered shots cannot be validated in this work.
+2. **The camera is the only device connected to this PC.** No ADwin, no RFSoC,
+   no DDS, no SLM. The production `HQA` connection table cannot be loaded in
+   BLACS at all, because every other device would fail to connect.
+
+### Test connection table
+
+Testing therefore runs against a dedicated minimal connection table containing
+nothing but dummy devices and the camera. `labscript_devices` ships
+`DummyPseudoclock` and `DummyIntermediateDevice` for exactly this purpose —
+`DummyPseudoclock` is documented as usable as the sole device in a connection
+table.
+
+Shipped as `AravisCamera/testing/connection_table_aravis_test.py` so it is
+version-controlled alongside the driver (note `userlib/labscriptlib` is not a
+git repository):
+
+```python
+from labscript import start, stop
+from labscript_devices.DummyPseudoclock.labscript_devices import DummyPseudoclock
+from labscript_devices.DummyIntermediateDevice import DummyIntermediateDevice
+from user_devices.AravisCamera.labscript_devices import AravisCamera
+
+DummyPseudoclock(name='dummy_clock', BLACS_connection='dummy')
+DummyIntermediateDevice(
+    name='dummy_device',
+    parent_device=dummy_clock.clockline,
+    BLACS_connection='dummy2',
+)
+
+AravisCamera(
+    'test_cam',
+    parent_device=dummy_device,
+    connection='camera_trigger',
+    serial_number='<from arv-tool-0.8>',
+    orientation='test',
+    trigger_duration=1e-3,
+    exception_on_failed_shot=False,
+    camera_attributes={
+        'TriggerMode':  'Off',      # free-run: no trigger wire exists
+        'ExposureAuto': 'Off',
+        'ExposureTime': 10000.0,
+        'PixelFormat':  'Mono8',
+    },
+    manual_mode_camera_attributes={
+        'TriggerMode': 'Off',
+    },
+)
+
+if __name__ == '__main__':
+    start()
+    stop(1)
+```
+
+Mechanics confirmed by inspection:
+
+- `TriggerableDevice.__init__` auto-creates a `Trigger` when the parent is an
+  intermediate device rather than an existing `Trigger`, so
+  `parent_device=dummy_device, connection='camera_trigger'` is sufficient.
+- `Trigger` subclasses `DigitalOut`, which is in
+  `DummyIntermediateDevice.allowed_children`.
+- `IMAQdxCamera.__init__` rejects any key in `manual_mode_camera_attributes`
+  that is absent from `camera_attributes`, so `TriggerMode` must appear in
+  both — as it does above.
+
+To use it, temporarily point `connection_table_py` in
+`labconfig/ultracold-HP-EliteDesk-800-G6-Tower-PC.ini` at this file and
+recompile the connection table. The production `HQA` table is left untouched;
+restoring is a one-line revert.
+
+To exercise the labscript/BLACS plumbing with **no hardware at all**, the same
+file with `mock=True` on the camera needs nothing connected.
+
+### Tiers
+
+All tiers below run against the test connection table above, never the
+production `HQA` table.
 
 | Tier | Requires | Validates |
 |---|---|---|
-| 1. `mock=True` | Nothing | Registration, BLACS tab, h5 layout, lyse access |
+| 0. `aravis_smoke_test.py` | Aravis + camera | Aravis alone, outside labscript entirely |
+| 1. `mock=True` | Nothing connected | Registration, BLACS tab, h5 layout, lyse access |
 | 2. `serial_number='Fake_1'` | Aravis installed | The real binding: discovery, typed attribute get/set, streaming, buffer→numpy |
 | 3. Firefly, manual mode | Camera + udev/usbfs | Enumeration by serial, live snap, feature read/write, continuous view |
 | 4. Firefly, free-run buffered shot | Camera only, **no trigger wire** | The whole buffered path end-to-end |
 | 5. Firefly, hardware-triggered shot | **Blocked — not wired** | Trigger timing only |
 
-Tier 4 is the key one the constraint does not block. It uses a **temporary,
-test-only** connection table in which `camera_attributes` sets
-`TriggerMode='Off'` instead of `'On'` — overriding the production value shown
-under "Connection table usage" above. The camera then free-runs, and
-`grab_multiple` collects `n_images` as fast as the sensor delivers them. This
-production value is restored once trigger wiring exists. The tier exercises arming, the
-abort-checking pop loop, buffer recycling, the acquisition thread, the timeout
-path, h5 writing, and lyse readback. The only thing left unvalidated is whether
-frames land at the correct times.
+Tiers 0–2 need no camera-specific hardware setup at all, so implementation can
+proceed and be largely validated before touching udev or usbfs.
+
+Tier 4 is the key one neither constraint blocks. The test table's
+`TriggerMode='Off'` makes the camera free-run, so `grab_multiple` collects
+`n_images` as fast as the sensor delivers them without any trigger wire. This
+exercises arming, the abort-checking pop loop, buffer recycling, the
+acquisition thread, the timeout path, h5 writing, and lyse readback — the
+entire buffered machinery. The only thing left unvalidated is whether frames
+land at the correct times.
+
+The production configuration under "Connection table usage" differs from the
+test table in exactly one respect: `TriggerMode='On'` plus the trigger source,
+selector, and activation. That is the delta that stays untested until wiring
+exists.
 
 `testing/aravis_smoke_test.py` runs standalone outside BLACS: enumerate
 devices, open by serial, print features by visibility, grab a frame, report
@@ -489,3 +619,5 @@ available slot to reuse.
    usage, and troubleshooting covering the usbfs symptom, udev permissions, and
    serial-number discovery
 7. `AravisCamera/testing/aravis_smoke_test.py`
+8. `AravisCamera/testing/connection_table_aravis_test.py` — minimal all-dummy
+   connection table, the only table any tier is tested against
