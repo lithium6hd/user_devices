@@ -65,11 +65,14 @@ class AravisCamera(IMAQdxCamera):
         """See :obj:`IMAQdxCamera` for the full argument documentation.
 
         The only behavioural difference is ``serial_number``: Aravis reports
-        the GenICam ``DeviceSerialNumber``, an opaque string which for FLIR
-        cameras is decimal. ``IMAQdxCamera`` parses string serials as
-        *hexadecimal*, which would silently address the wrong camera, so this
-        class does not call ``IMAQdxCamera.__init__`` and instead reproduces
-        its setup with the hex conversion removed.
+        the GenICam ``DeviceSerialNumber``, an opaque string, not to be
+        assumed decimal -- the bench camera reports ``0159787F``, which
+        contains hex letters, so ``int(serial, 16)`` *succeeds* on it and
+        silently returns 22640767 rather than raising. ``IMAQdxCamera``
+        parses string serials as *hexadecimal*, which would silently address
+        the wrong camera, so this class does not call
+        ``IMAQdxCamera.__init__`` and instead reproduces its setup with the
+        hex conversion removed.
         """
         self.trigger_edge_type = trigger_edge_type
         self.minimum_recovery_time = minimum_recovery_time

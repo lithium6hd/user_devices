@@ -204,9 +204,11 @@ self.BLACS_connection = hex(self.serial_number)[2:].upper()
 **String serial numbers are parsed as hexadecimal.** That is correct for
 IMAQdx, whose serials genuinely are hex (hence `1E1001551991` in the existing
 connection table). Aravis reports the GenICam `DeviceSerialNumber`, an opaque
-string that for FLIR is **decimal**. Inheriting this behaviour would silently
-reinterpret `"15551991"` as hex — a different number, with no error raised, and
-a BLACS tab labelled with a meaningless value.
+string, **not to be assumed decimal**: the bench camera reports `0159787F`,
+which contains hex letters, so `int(serial, 16)` **succeeds** on it and
+silently returns 22640767 rather than raising. Inheriting this behaviour
+would silently reinterpret a serial as hex — a different number, with no
+error raised, and a BLACS tab labelled with a meaningless value.
 
 `AravisCamera` therefore overrides `__init__`: it stores `serial_number`
 verbatim as a string, sets `BLACS_connection` to that same string so the BLACS
@@ -247,7 +249,38 @@ has no analogue here. The stock implementation is inherited.
 ### `blacs_workers.py`
 
 `AravisCameraWorker(IMAQdxCameraWorker)` sets `interface_class = Aravis_Camera`
-and adds nothing else. All logic lives in `Aravis_Camera`, described below.
+and additionally overrides two attribute-snapshot methods; almost all other
+logic lives in `Aravis_Camera`, described below.
+
+Both overrides exist because some GenICam features report themselves as
+available, implemented, and readable (or writeable), yet raise when actually
+accessed outside acquisition -- on this FLIR Blackfly S, the `Chunk*` and
+`Event*` families. `get_attribute_names` has no static predicate that can
+tell these apart from the features that genuinely work, so the guard has to
+live at the point where names are actually read, in the worker:
+
+| visibility level | features listed | of those, raise when read |
+|---|---|---|
+| `simple` | 57 | 0 |
+| `intermediate` | 193 | 26 |
+| `advanced` | 223 | 26 |
+
+`intermediate` is the default `saved_attribute_visibility_level`, and
+`transition_to_buffered` calls `get_attributes_as_dict` on every buffered
+shot to snapshot attributes into the shot file. Upstream's
+`get_attributes_as_dict` builds that snapshot with an unguarded dict
+comprehension, so without an override, every buffered shot at the default
+visibility level aborts in `transition_to_buffered` the moment it reaches
+the first raising name. `AravisCameraWorker.get_attributes_as_dict` reads
+each name individually, skips (and logs) the ones that raise, and returns
+the rest.
+
+`get_attributes_as_text` is overridden separately: it is the text BLACS'
+attributes dialog offers for copying into a connection table's
+`camera_attributes`, so unlike the shot-file snapshot it must contain only
+*writeable* names (88 of the 193 `intermediate` names are read-only) --
+pasting a read-only name into `camera_attributes` makes `set_attribute`
+raise, `apply_with_retry` re-raise, and the worker fail in `init()`.
 
 ## The `Aravis_Camera` binding
 

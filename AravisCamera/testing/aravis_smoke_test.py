@@ -3,10 +3,10 @@
 Use this first when the camera misbehaves: it isolates Aravis from the rest
 of the stack.
 
-Usage:
-    .labscript/bin/python AravisCamera/testing/aravis_smoke_test.py
-    .labscript/bin/python AravisCamera/testing/aravis_smoke_test.py <serial>
-    .labscript/bin/python AravisCamera/testing/aravis_smoke_test.py Fake_1
+Usage (run from /home/ultracold/labscript-suite/userlib/user_devices):
+    ../../.labscript/bin/python AravisCamera/testing/aravis_smoke_test.py
+    ../../.labscript/bin/python AravisCamera/testing/aravis_smoke_test.py <serial>
+    ../../.labscript/bin/python AravisCamera/testing/aravis_smoke_test.py Fake_1
 """
 import sys
 

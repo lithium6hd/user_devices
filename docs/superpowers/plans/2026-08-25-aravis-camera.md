@@ -10,6 +10,17 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-25-aravis-camera-design.md`
 
+## Status
+
+Tasks 1-7 are implemented, reviewed, and committed on `aravis-camera` (see
+`git log` for the per-commit history). Task 8 -- real-camera validation
+inside the running BLACS GUI -- is outstanding and requires a human
+operator; it is not something an agent can complete unattended. The
+checkboxes below are left unticked as a record of this: they are not
+intended to be ticked off individually as a post-hoc formality. See
+`AravisCamera/README.md`'s "Validation status" section for exactly what has
+and has not been verified so far.
+
 ## Global Constraints
 
 - **Branch:** all work happens on `aravis-camera` in `/home/ultracold/labscript-suite/userlib/user_devices`. Never commit to `main`.
@@ -309,11 +320,14 @@ class AravisCamera(IMAQdxCamera):
         """See :obj:`IMAQdxCamera` for the full argument documentation.
 
         The only behavioural difference is ``serial_number``: Aravis reports
-        the GenICam ``DeviceSerialNumber``, an opaque string which for FLIR
-        cameras is decimal. ``IMAQdxCamera`` parses string serials as
-        *hexadecimal*, which would silently address the wrong camera, so this
-        class does not call ``IMAQdxCamera.__init__`` and instead reproduces
-        its setup with the hex conversion removed.
+        the GenICam ``DeviceSerialNumber``, an opaque string, not to be
+        assumed decimal -- the bench camera reports ``0159787F``, which
+        contains hex letters, so ``int(serial, 16)`` *succeeds* on it and
+        silently returns 22640767 rather than raising. ``IMAQdxCamera``
+        parses string serials as *hexadecimal*, which would silently address
+        the wrong camera, so this class does not call
+        ``IMAQdxCamera.__init__`` and instead reproduces its setup with the
+        hex conversion removed.
         """
         self.trigger_edge_type = trigger_edge_type
         self.minimum_recovery_time = minimum_recovery_time
