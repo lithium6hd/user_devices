@@ -71,3 +71,103 @@ def test_decode_buffer_returns_owned_copy():
     image = decode_buffer(data, width, height)
     assert image.flags['OWNDATA']
     assert image.flags['WRITEABLE']
+
+
+from user_devices.AravisCamera.aravis_utils import (
+    apply_with_retry,
+    find_serial,
+    visibility_names,
+)
+
+
+def test_visibility_names_levels():
+    assert visibility_names('simple') == ('BEGINNER',)
+    assert visibility_names('intermediate') == ('BEGINNER', 'EXPERT')
+    assert visibility_names('advanced') == ('BEGINNER', 'EXPERT', 'GURU')
+
+
+def test_visibility_names_is_case_insensitive():
+    assert visibility_names('Simple') == ('BEGINNER',)
+
+
+def test_visibility_names_rejects_unknown_level():
+    with pytest.raises(ValueError, match="invalid visibility level"):
+        visibility_names('nonsense')
+
+
+def test_find_serial_matches_string():
+    assert find_serial(['111', '222', '333'], '222') == 1
+
+
+def test_find_serial_compares_as_strings():
+    """Aravis returns serials as strings; a user may write an int."""
+    assert find_serial(['111', '222'], 222) == 1
+
+
+def test_find_serial_returns_none_when_absent():
+    assert find_serial(['111', '222'], '999') is None
+
+
+def test_find_serial_handles_empty_list():
+    assert find_serial([], '111') is None
+
+
+class _RecordingSetter:
+    """Test double for a camera attribute setter.
+
+    Fails for names in ``fail_names`` until each has been attempted
+    ``fail_times`` times, then succeeds.
+    """
+
+    def __init__(self, fail_names=(), fail_times=1):
+        self.calls = []
+        self.attempts = {}
+        self.fail_names = set(fail_names)
+        self.fail_times = fail_times
+
+    def __call__(self, name, value):
+        self.calls.append((name, value))
+        self.attempts[name] = self.attempts.get(name, 0) + 1
+        if name in self.fail_names and self.attempts[name] <= self.fail_times:
+            raise RuntimeError(f"simulated failure setting {name}")
+
+
+def test_apply_with_retry_applies_all_attributes_once():
+    setter = _RecordingSetter()
+    apply_with_retry(setter, {'A': 1, 'B': 2})
+    assert setter.calls == [('A', 1), ('B', 2)]
+
+
+def test_apply_with_retry_preserves_dict_order():
+    """Users control GenICam ordering through dict insertion order."""
+    setter = _RecordingSetter()
+    apply_with_retry(setter, {'OffsetX': 0, 'Width': 100, 'OffsetY': 0})
+    assert [name for name, _ in setter.calls] == ['OffsetX', 'Width', 'OffsetY']
+
+
+def test_apply_with_retry_retries_a_failure_once():
+    """The motivating case: setting Width before OffsetX can fail because the
+    old offset plus the new width exceeds the sensor, then succeed on retry."""
+    setter = _RecordingSetter(fail_names={'Width'}, fail_times=1)
+    apply_with_retry(setter, {'Width': 100, 'OffsetX': 0})
+    assert setter.attempts['Width'] == 2
+    assert setter.attempts['OffsetX'] == 1
+
+
+def test_apply_with_retry_raises_when_failure_persists():
+    setter = _RecordingSetter(fail_names={'Bogus'}, fail_times=99)
+    with pytest.raises(RuntimeError, match="Bogus"):
+        apply_with_retry(setter, {'Bogus': 1})
+
+
+def test_apply_with_retry_does_not_retry_successes():
+    setter = _RecordingSetter(fail_names={'B'}, fail_times=1)
+    apply_with_retry(setter, {'A': 1, 'B': 2, 'C': 3})
+    assert setter.attempts['A'] == 1
+    assert setter.attempts['C'] == 1
+
+
+def test_apply_with_retry_accepts_empty_dict():
+    setter = _RecordingSetter()
+    apply_with_retry(setter, {})
+    assert setter.calls == []

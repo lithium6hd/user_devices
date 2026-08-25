@@ -63,3 +63,86 @@ def decode_buffer(data, width, height):
     """
     dtype = _DTYPES[bytes_per_pixel(len(data), width, height)]
     return np.frombuffer(data, dtype=dtype).reshape(height, width).copy()
+
+
+#: labscript visibility level -> GenICam visibility names, least to most
+#: obscure. Converted to Aravis enum members at call time so this module
+#: stays free of Aravis imports.
+_VISIBILITY_NAMES = {
+    'simple': ('BEGINNER',),
+    'intermediate': ('BEGINNER', 'EXPERT'),
+    'advanced': ('BEGINNER', 'EXPERT', 'GURU'),
+}
+
+
+def visibility_names(level):
+    """Map a labscript visibility level to GenICam visibility names.
+
+    Args:
+        level (str): 'simple', 'intermediate' or 'advanced'.
+
+    Returns:
+        tuple of str: GenICam visibility names, e.g. ``('BEGINNER', 'EXPERT')``.
+
+    Raises:
+        ValueError: if the level is not recognised.
+    """
+    try:
+        return _VISIBILITY_NAMES[level.lower()]
+    except (AttributeError, KeyError):
+        raise ValueError(
+            f"invalid visibility level {level!r}, expected one of "
+            f"{sorted(_VISIBILITY_NAMES)}"
+        ) from None
+
+
+def find_serial(serials, wanted):
+    """Find the index of ``wanted`` in ``serials``, comparing as strings.
+
+    Args:
+        serials (sequence): serial numbers as reported by Aravis.
+        wanted: the serial being searched for; coerced to str.
+
+    Returns:
+        int or None: index of the match, or None if absent.
+    """
+    wanted = str(wanted)
+    for index, serial in enumerate(serials):
+        if str(serial) == wanted:
+            return index
+    return None
+
+
+def apply_with_retry(setter, attributes):
+    """Apply ``attributes`` via ``setter(name, value)``, retrying failures once.
+
+    GenICam features are interdependent: setting ``Width`` before ``OffsetX``
+    can fail because the existing offset plus the new width exceeds the
+    sensor, yet succeed once the other features have been applied. Rather
+    than maintain a dependency graph, this makes one pass in dict order,
+    collects failures, then retries them once.
+
+    Args:
+        setter (callable): called as ``setter(name, value)``; raises on failure.
+        attributes (dict): feature name -> value, applied in insertion order.
+
+    Raises:
+        Exception: the second failure for any feature that fails twice, with
+            the first failure chained as its cause.
+    """
+    failures = {}
+    for name, value in attributes.items():
+        try:
+            setter(name, value)
+        except Exception as first_error:
+            failures[name] = (value, first_error)
+
+    for name, (value, first_error) in failures.items():
+        try:
+            setter(name, value)
+        except Exception as second_error:
+            raise type(second_error)(
+                f"failed to set attribute {name} to {value!r} on two "
+                f"attempts. First error: {first_error}. "
+                f"Second error: {second_error}"
+            ) from first_error
