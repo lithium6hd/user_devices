@@ -141,7 +141,7 @@ def apply_with_retry(setter, attributes):
         try:
             setter(name, value)
         except Exception as second_error:
-            raise type(second_error)(
+            raise RuntimeError(
                 f"failed to set attribute {name} to {value!r} on two "
                 f"attempts. First error: {first_error}. "
                 f"Second error: {second_error}"

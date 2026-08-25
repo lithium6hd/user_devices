@@ -158,6 +158,7 @@ def test_apply_with_retry_raises_when_failure_persists():
     setter = _RecordingSetter(fail_names={'Bogus'}, fail_times=99)
     with pytest.raises(RuntimeError, match="Bogus"):
         apply_with_retry(setter, {'Bogus': 1})
+    assert setter.attempts['Bogus'] == 2
 
 
 def test_apply_with_retry_does_not_retry_successes():
