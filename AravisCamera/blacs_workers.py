@@ -5,9 +5,10 @@
 # Aravis (GenICam) camera worker for BLACS.                         #
 #                                                                   #
 #####################################################################
-# IMAQdxCameraWorker and decode_buffer are not used by Aravis_Camera itself;
-# they are consumed by the acquisition half and the BLACS worker subclass that
-# follow in this same module.
+# IMAQdxCameraWorker is not used by Aravis_Camera itself; it is consumed by the
+# BLACS worker subclass that follows in this same module.
+import sys
+
 from labscript_devices.IMAQdxCamera.blacs_workers import IMAQdxCameraWorker
 
 from user_devices.AravisCamera.aravis_utils import (
@@ -252,6 +253,123 @@ class Aravis_Camera(object):
         if isinstance(root, Aravis.GcCategory):
             walk(root)
         return names
+
+    # ---------------------------------------------------------------- acquisition
+
+    #: How long to wait for a buffer before checking the abort flag, in
+    #: microseconds. Short enough that BLACS' abort button stays responsive
+    #: while the camera waits for a hardware trigger.
+    POLL_TIMEOUT_US = 200_000
+
+    def _buffer_to_array(self, buffer):
+        """Copy a filled ArvBuffer into a numpy array that owns its memory.
+
+        The copy is not optional: the buffer is pushed straight back to the
+        stream and overwritten by a later frame.
+        """
+        return decode_buffer(
+            buffer.get_data(),
+            buffer.get_image_width(),
+            buffer.get_image_height(),
+        )
+
+    def configure_acquisition(self, continuous=True, bufferCount=5):
+        """Create the stream, allocate buffers, and start acquisition.
+
+        Note this *starts* acquisition, matching IMAQdxCamera semantics that
+        transition_to_buffered relies on: it calls configure_acquisition and
+        then immediately runs grab_multiple in a thread. Both continuous and
+        buffered use GenICam AcquisitionMode 'Continuous'; ``continuous`` only
+        reflects the caller's intent and is accepted for signature
+        compatibility.
+        """
+        self._abort_acquisition = False
+        self.camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+        payload = self.camera.get_payload()
+        self.stream = self.camera.create_stream(None, None)
+        if self.stream is None:
+            raise RuntimeError("failed to create Aravis stream")
+        for _ in range(bufferCount):
+            self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+        self.camera.start_acquisition()
+
+    def snap(self):
+        """Acquire a single image and return it.
+
+        Uses ArvCamera's one-shot helper, which manages a stream of its own;
+        it does not need, and does not touch, self.stream.
+        """
+        buffer = self.camera.acquisition(0)
+        if buffer is None:
+            raise RuntimeError("failed to acquire an image")
+        return self._buffer_to_array(buffer)
+
+    def grab(self, waitForNextBuffer=True):
+        """Grab one image from a stream already started by configure_acquisition."""
+        buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+        if buffer is None:
+            raise TimeoutError("timed out waiting for a frame")
+        try:
+            status = buffer.get_status()
+            if status != Aravis.BufferStatus.SUCCESS:
+                raise RuntimeError(f"buffer received with status {status}")
+            return self._buffer_to_array(buffer)
+        finally:
+            # Every popped buffer goes back to the pool, on every path. A
+            # leaked buffer starves the pool and the next pop blocks forever.
+            self.stream.push_buffer(buffer)
+
+    def grab_multiple(self, n_images, images, waitForNextBuffer=True):
+        """Grab n_images frames, appending each to the images list.
+
+        Polls with a timeout rather than blocking so that _abort_acquisition
+        is checked regularly: this is what keeps BLACS' abort responsive while
+        the camera is armed and waiting for triggers.
+        """
+        print(f"Attempting to grab {n_images} images.")
+        for i in range(n_images):
+            while True:
+                if self._abort_acquisition:
+                    print("Abort during acquisition.")
+                    self._abort_acquisition = False
+                    return
+                buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+                if buffer is None:
+                    # No frame yet: loop round and re-check the abort flag.
+                    print('.', end='')
+                    sys.stdout.flush()
+                    continue
+                try:
+                    status = buffer.get_status()
+                    if status != Aravis.BufferStatus.SUCCESS:
+                        msg = (
+                            f"image {i + 1} of {n_images} received with "
+                            f"buffer status {status}"
+                        )
+                        if self.exception_on_failed_shot:
+                            raise RuntimeError(msg)
+                        # Matching IMAQdxCamera: report the bad frame, give up
+                        # on this image, and move on to the next one.
+                        print(msg, file=sys.stderr)
+                        break
+                    images.append(self._buffer_to_array(buffer))
+                finally:
+                    # Reached on every exit from the try, including the raise
+                    # and the break above, so no buffer is ever leaked.
+                    self.stream.push_buffer(buffer)
+                print(f"Got image {i + 1} of {n_images}.")
+                break
+        print(f"Got {len(images)} of {n_images} images.")
+
+    def stop_acquisition(self):
+        """Stop acquisition and release the stream and its buffers."""
+        self.camera.stop_acquisition()
+        # Dropping the stream reference frees its buffers.
+        self.stream = None
+
+    def abort_acquisition(self):
+        """Ask a running grab_multiple to return early. Safe from any thread."""
+        self._abort_acquisition = True
 
     # ---------------------------------------------------------------- lifecycle
 
