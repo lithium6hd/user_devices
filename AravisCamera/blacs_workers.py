@@ -8,6 +8,7 @@
 # IMAQdxCameraWorker is not used by Aravis_Camera itself; it is consumed by the
 # BLACS worker subclass that follows in this same module.
 import sys
+import time
 
 from labscript_devices.IMAQdxCamera.blacs_workers import IMAQdxCameraWorker
 
@@ -283,6 +284,13 @@ class Aravis_Camera(object):
         reflects the caller's intent and is accepted for signature
         compatibility.
         """
+        # Defends against a stream leaked by a prior transition_to_buffered
+        # that failed between configure_acquisition and the acquisition
+        # thread starting: abort() only calls stop_acquisition() when the
+        # thread exists, so a stream from that failed attempt can still be
+        # live and the camera still acquiring when this method runs again.
+        if self.stream is not None:
+            self.stop_acquisition()
         self._abort_acquisition = False
         self.camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
         payload = self.camera.get_payload()
@@ -304,11 +312,37 @@ class Aravis_Camera(object):
             raise RuntimeError("failed to acquire an image")
         return self._buffer_to_array(buffer)
 
+    #: Overall time budget for grab(), in seconds. IMAQdxCameraWorker's
+    #: continuous_loop calls self.camera.grab() with no exception handling,
+    #: so on a camera slower than 1/POLL_TIMEOUT_US (~5 fps, e.g. a long
+    #: exposure) or one that is trigger-armed with no trigger arriving, a
+    #: single POLL_TIMEOUT_US poll is nowhere near enough headroom: it would
+    #: raise TimeoutError and kill the continuous-mode thread, leaving the
+    #: GUI showing a live "stop" button with no frames ever arriving again.
+    #: Polling repeatedly up to this deadline instead lets grab() ride out
+    #: an occasional slow frame while still bounding the wait and still
+    #: checking _abort_acquisition regularly.
+    GRAB_TIMEOUT_S = 5.0
+
     def grab(self, waitForNextBuffer=True):
-        """Grab one image from a stream already started by configure_acquisition."""
-        buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+        """Grab one image from a stream already started by configure_acquisition.
+
+        Polls repeatedly (rather than giving up after one POLL_TIMEOUT_US
+        wait) until a frame arrives or GRAB_TIMEOUT_S has elapsed overall,
+        checking _abort_acquisition between polls so abort stays responsive.
+        """
+        deadline = time.monotonic() + self.GRAB_TIMEOUT_S
+        buffer = None
+        while time.monotonic() < deadline:
+            if self._abort_acquisition:
+                raise TimeoutError("acquisition aborted while waiting for a frame")
+            buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+            if buffer is not None:
+                break
         if buffer is None:
-            raise TimeoutError("timed out waiting for a frame")
+            raise TimeoutError(
+                f"timed out waiting for a frame after {self.GRAB_TIMEOUT_S}s"
+            )
         try:
             status = buffer.get_status()
             if status != Aravis.BufferStatus.SUCCESS:
@@ -377,3 +411,50 @@ class Aravis_Camera(object):
         self.stream = None
         self.device = None
         self.camera = None
+
+
+class AravisCameraWorker(IMAQdxCameraWorker):
+    """BLACS worker for Aravis cameras.
+
+    All buffered-shot logic, HDF5 output and image transport are inherited;
+    only the camera interface class and the attribute snapshot differ.
+    """
+
+    interface_class = Aravis_Camera
+
+    def get_attributes_as_dict(self, visibility_level):
+        """Return a dict of readable attributes at the given visibility level.
+
+        Overrides the base implementation, which builds this dict with an
+        unguarded comprehension:
+
+            {name: self.camera.get_attribute(name) for name in names}
+
+        Some GenICam features are advertised as readable but raise when
+        actually read outside acquisition. On this FLIR Blackfly S, 26 of the
+        Chunk*/Event* family do exactly that, and they appear at
+        ``'intermediate'`` -- which is the DEFAULT
+        ``saved_attribute_visibility_level``. Since
+        ``transition_to_buffered`` calls this to snapshot attributes into the
+        shot file, the base implementation aborts every buffered shot on a
+        stock configuration.
+
+        No static predicate distinguishes these features: ``is_available``,
+        ``is_implemented`` and the access mode all report them as readable.
+        The only reliable test is to read and skip what fails.
+        """
+        attributes = {}
+        skipped = []
+        for name in self.camera.get_attribute_names(visibility_level):
+            try:
+                attributes[name] = self.camera.get_attribute(name)
+            except Exception:
+                skipped.append(name)
+        if skipped:
+            preview = ', '.join(skipped[:5])
+            suffix = ', ...' if len(skipped) > 5 else ''
+            print(
+                f"Skipped {len(skipped)} attribute(s) that are advertised as "
+                f"readable but raised on read: {preview}{suffix}"
+            )
+        return attributes
