@@ -311,7 +311,15 @@ class ADwinDIO32(_ADwinCard):
         
         digital_dtypes = [("n_cycles",np.int32), ("bitfield",np.uint32)]
         self.digital_data = np.empty(len(all_change_times), dtype=digital_dtypes)
-        self.digital_data["n_cycles"] = np.array(all_change_times) / self._TiCo.clock_resolution
+        # Round to the nearest cycle rather than letting the assignment into the
+        # int32 field truncate. Change times are quantised to the TiCo
+        # resolution but are not exactly representable in float64, so a time
+        # sitting on cycle N often comes out as N-0.0000000002. Truncating that
+        # puts the event one cycle early, where it can collide with the
+        # preceding event and give two rows the same n_cycles - which the TiCo
+        # cannot execute, as it applies at most one bitfield per cycle.
+        # Matches the analog tables, which use np.round() the same way.
+        self.digital_data["n_cycles"] = np.round(np.array(all_change_times) * self._TiCo.clock_limit)
         self.digital_data["bitfield"] = bits
 
 

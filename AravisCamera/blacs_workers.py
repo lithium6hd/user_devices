@@ -1,0 +1,519 @@
+#####################################################################
+#                                                                   #
+# /user_devices/AravisCamera/blacs_workers.py                       #
+#                                                                   #
+# Aravis (GenICam) camera worker for BLACS.                         #
+#                                                                   #
+#####################################################################
+# IMAQdxCameraWorker is not used by Aravis_Camera itself; it is consumed by the
+# BLACS worker subclass that follows in this same module.
+import sys
+import time
+
+from labscript_devices.IMAQdxCamera.blacs_workers import IMAQdxCameraWorker
+
+from user_devices.AravisCamera.aravis_utils import (
+    apply_with_retry,
+    decode_buffer,
+    find_serial,
+    visibility_names,
+)
+
+# Imported lazily in Aravis_Camera.__init__ so this module can be imported on
+# machines without Aravis: mock mode, runmanager, and the unit tests.
+Aravis = None
+
+
+class Aravis_Camera(object):
+    """Adapts an Aravis GenICam camera to the interface IMAQdxCameraWorker uses.
+
+    Attribute access goes through ``ArvDevice``'s typed feature accessors
+    (``get_string_feature_value`` and friends), which take a bare GenICam
+    feature name such as ``'ExposureTime'`` -- never an IMAQdx-style
+    ``'Category::Feature'`` path.
+    """
+
+    def __init__(self, serial_number):
+        global Aravis
+
+        try:
+            import gi
+        except ImportError as e:
+            raise ImportError(
+                "PyGObject ('gi') is not available in this environment. It is "
+                "not pip-installable here; symlink the system package into the "
+                "venv as described in AravisCamera/README.md, section 2."
+            ) from e
+
+        try:
+            gi.require_version('Aravis', '0.8')
+            from gi.repository import Aravis as _Aravis
+        except (ImportError, ValueError) as e:
+            raise ImportError(
+                "The Aravis GObject-introspection typelib is not installed. "
+                "Run: sudo apt install libaravis-0.8-0 gir1.2-aravis-0.8 "
+                "aravis-tools-cli  (see AravisCamera/README.md, section 1)."
+            ) from e
+
+        Aravis = _Aravis
+
+        self.serial_number = str(serial_number)
+        self.exception_on_failed_shot = True
+        self._abort_acquisition = False
+        self.stream = None
+
+        if self.serial_number.startswith('Fake'):
+            # Aravis' built-in fake GenICam device, addressed by id not serial.
+            Aravis.enable_interface('Fake')
+            self.camera = Aravis.Camera.new(self.serial_number)
+        else:
+            print("Finding camera...")
+            Aravis.update_device_list()
+            serials = [
+                Aravis.get_device_serial_nbr(i)
+                for i in range(Aravis.get_n_devices())
+            ]
+            index = find_serial(serials, self.serial_number)
+            if index is None:
+                raise ValueError(
+                    f"No connected camera with serial number "
+                    f"{self.serial_number!r}. Found: {serials}. "
+                    f"Note that Aravis reports the GenICam DeviceSerialNumber, "
+                    f"which differs from an IMAQdx-format serial. "
+                    f"Run 'arv-tool-0.8' to list cameras."
+                )
+            print("Connecting to camera...")
+            self.camera = Aravis.Camera.new(Aravis.get_device_id(index))
+
+        self.device = self.camera.get_device()
+
+    # ---------------------------------------------------------------- attributes
+
+    def _feature_node(self, name):
+        """Return the ``ArvGcNode`` for a feature, or raise if absent.
+
+        ``ArvDevice.get_feature`` returns None for an unknown name rather
+        than raising, so the check has to be explicit.
+        """
+        node = self.device.get_feature(name)
+        if node is None:
+            raise ValueError(
+                f"camera has no GenICam feature named {name!r}. Run "
+                f"'arv-tool-0.8 features' to list available features. Note "
+                f"that names are bare, not IMAQdx-style 'Category::Feature'."
+            )
+        return node
+
+    def _readers(self):
+        """Node types to the ArvDevice accessor that reads them, in dispatch order.
+
+        The single source of truth for which features are readable, shared by
+        get_attribute() and get_attribute_names() so the two cannot drift.
+
+        Order matters. ArvGcEnumeration is a concrete node that *implements*
+        the ArvGcInteger interface as well as ArvGcString, so
+        ``isinstance(node, Aravis.GcInteger)`` is True for an enumeration.
+        Tested in the other order, PixelFormat would read back as the raw PFNC
+        integer 17301505 rather than 'Mono8'.
+        """
+        return (
+            ((Aravis.GcEnumeration, Aravis.GcString), 'get_string_feature_value'),
+            ((Aravis.GcBoolean,), 'get_boolean_feature_value'),
+            ((Aravis.GcInteger,), 'get_integer_feature_value'),
+            ((Aravis.GcFloat,), 'get_float_feature_value'),
+        )
+
+    def get_attribute(self, name):
+        """Return the current value of the named GenICam feature."""
+        node = self._feature_node(name)
+        for types, accessor in self._readers():
+            if isinstance(node, types):
+                try:
+                    return getattr(self.device, accessor)(name)
+                except Exception as e:
+                    raise Exception(f"Failed to get attribute {name}") from e
+        raise TypeError(
+            f"cannot read GenICam feature {name!r} of type "
+            f"{type(node).__name__}"
+        )
+
+    def set_attribute(self, name, value):
+        """Set the named GenICam feature to the given value.
+
+        A command feature has no value: writing to it executes it, whatever
+        ``value`` is.
+        """
+        node = self._feature_node(name)
+        # Same ordering rationale as _readers(): enumerations must be matched
+        # before the integer interface they also implement.
+        if isinstance(node, Aravis.GcCommand):
+            writer, cast = None, None
+        elif isinstance(node, (Aravis.GcEnumeration, Aravis.GcString)):
+            writer, cast = 'set_string_feature_value', str
+        elif isinstance(node, Aravis.GcBoolean):
+            writer, cast = 'set_boolean_feature_value', bool
+        elif isinstance(node, Aravis.GcInteger):
+            writer, cast = 'set_integer_feature_value', int
+        elif isinstance(node, Aravis.GcFloat):
+            writer, cast = 'set_float_feature_value', float
+        else:
+            # Raised outside the try below so it is not re-wrapped: an
+            # unwritable node type is a programming error, not a device error.
+            raise TypeError(
+                f"cannot write GenICam feature {name!r} of type "
+                f"{type(node).__name__}"
+            )
+
+        try:
+            if writer is None:
+                self.device.execute_command(name)
+            else:
+                getattr(self.device, writer)(name, cast(value))
+        except Exception as e:
+            raise Exception(f"failed to set attribute {name} to {value}") from e
+
+    def set_attributes(self, attr_dict):
+        """Set many features, retrying failures once (see apply_with_retry)."""
+        apply_with_retry(self.set_attribute, attr_dict)
+
+    def get_attribute_names(self, visibility_level, writeable_only=False):
+        """List readable feature names at or below the given visibility level.
+
+        The names are gathered by walking the GenICam category tree from
+        'Root', since ArvGc exposes no flat feature listing.
+
+        Excluded are: commands (reading one would execute it), write-only
+        features (they have no value to read), and features whose node type
+        none of ``get_attribute``'s typed accessors handles, such as the raw
+        ``ArvGcRegisterNode`` behind ``LUTValueAll``.
+
+        This is a static filter, and GenICam offers no static predicate for
+        the remaining case: a handful of features -- the ``Chunk*`` and
+        ``Event*`` families on this FLIR -- report themselves available and
+        implemented yet raise on read, because they are backed by a data port
+        that is only populated during acquisition. Callers that read every
+        listed name should tolerate a per-feature failure.
+
+        Args:
+            visibility_level (str): 'simple', 'intermediate' or 'advanced'.
+            writeable_only (bool): if True, restrict the result to features
+                that are read-write, dropping the read-only ones.
+        """
+        wanted_visibility = {
+            getattr(Aravis.GcVisibility, name)
+            for name in visibility_names(visibility_level)
+        }
+        if writeable_only:
+            wanted_access = {Aravis.GcAccessMode.RW}
+        else:
+            wanted_access = {Aravis.GcAccessMode.RO, Aravis.GcAccessMode.RW}
+
+        readable_types = tuple(
+            t for types, _ in self._readers() for t in types
+        )
+
+        genicam = self.device.get_genicam()
+        names = []
+        seen = set()
+
+        def walk(category_node):
+            for feature_name in category_node.get_features():
+                if feature_name in seen:
+                    continue
+                seen.add(feature_name)
+                node = genicam.get_node(feature_name)
+                if node is None:
+                    continue
+                if isinstance(node, Aravis.GcCategory):
+                    walk(node)
+                    continue
+                if isinstance(node, Aravis.GcCommand):
+                    # Reading a command would execute it.
+                    continue
+                if not isinstance(node, Aravis.GcFeatureNode):
+                    continue
+                if not isinstance(node, readable_types):
+                    # get_attribute() has no typed accessor for this node.
+                    continue
+                try:
+                    if not node.is_available():
+                        continue
+                    if not node.is_implemented():
+                        continue
+                    if node.get_visibility() not in wanted_visibility:
+                        continue
+                    if node.get_actual_access_mode() not in wanted_access:
+                        continue
+                except Exception:
+                    # A feature whose availability cannot even be evaluated
+                    # cannot be read either; skip it rather than abort the walk.
+                    continue
+                names.append(feature_name)
+
+        root = genicam.get_node('Root')
+        if isinstance(root, Aravis.GcCategory):
+            walk(root)
+        return names
+
+    # ---------------------------------------------------------------- acquisition
+
+    #: How long to wait for a buffer before checking the abort flag, in
+    #: microseconds. Short enough that BLACS' abort button stays responsive
+    #: while the camera waits for a hardware trigger.
+    POLL_TIMEOUT_US = 200_000
+
+    def _buffer_to_array(self, buffer):
+        """Copy a filled ArvBuffer into a numpy array that owns its memory.
+
+        The copy is not optional: the buffer is pushed straight back to the
+        stream and overwritten by a later frame.
+        """
+        return decode_buffer(
+            buffer.get_data(),
+            buffer.get_image_width(),
+            buffer.get_image_height(),
+        )
+
+    def configure_acquisition(self, continuous=True, bufferCount=5):
+        """Create the stream, allocate buffers, and start acquisition.
+
+        Note this *starts* acquisition, matching IMAQdxCamera semantics that
+        transition_to_buffered relies on: it calls configure_acquisition and
+        then immediately runs grab_multiple in a thread. Both continuous and
+        buffered use GenICam AcquisitionMode 'Continuous'; ``continuous`` only
+        reflects the caller's intent and is accepted for signature
+        compatibility.
+        """
+        # Defends against a stream leaked by a prior transition_to_buffered
+        # that failed between configure_acquisition and the acquisition
+        # thread starting: abort() only calls stop_acquisition() when the
+        # thread exists, so a stream from that failed attempt can still be
+        # live and the camera still acquiring when this method runs again.
+        if self.stream is not None:
+            self.stop_acquisition()
+        self._abort_acquisition = False
+        self.camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+        payload = self.camera.get_payload()
+        self.stream = self.camera.create_stream(None, None)
+        if self.stream is None:
+            raise RuntimeError("failed to create Aravis stream")
+        for _ in range(bufferCount):
+            self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+        self.camera.start_acquisition()
+
+    def snap(self):
+        """Acquire a single image and return it.
+
+        Uses ArvCamera's one-shot helper, which manages a stream of its own;
+        it does not need, and does not touch, self.stream.
+
+        Passes a real timeout (derived from GRAB_TIMEOUT_S) rather than 0:
+        0 means an untimed wait, and a camera left in TriggerMode='On' with
+        no trigger arriving would otherwise wedge this call, and the worker
+        with it, indefinitely.
+        """
+        buffer = self.camera.acquisition(int(self.GRAB_TIMEOUT_S * 1_000_000))
+        if buffer is None:
+            raise RuntimeError(
+                f"acquisition timed out after {self.GRAB_TIMEOUT_S}s waiting "
+                f"for an image. If the camera is left in TriggerMode='On' "
+                f"with no trigger arriving, this is expected: switch to "
+                f"manual mode (which applies manual_mode_camera_attributes) "
+                f"or provide a trigger."
+            )
+        return self._buffer_to_array(buffer)
+
+    #: Overall time budget for grab(), in seconds. IMAQdxCameraWorker's
+    #: continuous_loop calls self.camera.grab() with no exception handling,
+    #: so on a camera slower than 1/POLL_TIMEOUT_US (~5 fps, e.g. a long
+    #: exposure) or one that is trigger-armed with no trigger arriving, a
+    #: single POLL_TIMEOUT_US poll is nowhere near enough headroom: it would
+    #: raise TimeoutError and kill the continuous-mode thread, leaving the
+    #: GUI showing a live "stop" button with no frames ever arriving again.
+    #: Polling repeatedly up to this deadline instead lets grab() ride out
+    #: an occasional slow frame while still bounding the wait and still
+    #: checking _abort_acquisition regularly.
+    GRAB_TIMEOUT_S = 5.0
+
+    def grab(self, waitForNextBuffer=True):
+        """Grab one image from a stream already started by configure_acquisition.
+
+        Polls repeatedly (rather than giving up after one POLL_TIMEOUT_US
+        wait) until a frame arrives or GRAB_TIMEOUT_S has elapsed overall,
+        checking _abort_acquisition between polls so abort stays responsive.
+        """
+        deadline = time.monotonic() + self.GRAB_TIMEOUT_S
+        buffer = None
+        while time.monotonic() < deadline:
+            if self._abort_acquisition:
+                raise TimeoutError("acquisition aborted while waiting for a frame")
+            buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+            if buffer is not None:
+                break
+        if buffer is None:
+            raise TimeoutError(
+                f"timed out waiting for a frame after {self.GRAB_TIMEOUT_S}s"
+            )
+        try:
+            status = buffer.get_status()
+            if status != Aravis.BufferStatus.SUCCESS:
+                raise RuntimeError(
+                    f"buffer received with status "
+                    f"{getattr(status, 'value_nick', status)!r}"
+                )
+            return self._buffer_to_array(buffer)
+        finally:
+            # Every popped buffer goes back to the pool, on every path. A
+            # leaked buffer starves the pool and the next pop blocks forever.
+            self.stream.push_buffer(buffer)
+
+    def grab_multiple(self, n_images, images, waitForNextBuffer=True):
+        """Grab n_images frames, appending each to the images list.
+
+        Polls with a timeout rather than blocking so that _abort_acquisition
+        is checked regularly: this is what keeps BLACS' abort responsive while
+        the camera is armed and waiting for triggers.
+        """
+        print(f"Attempting to grab {n_images} images.")
+        for i in range(n_images):
+            while True:
+                if self._abort_acquisition:
+                    print("Abort during acquisition.")
+                    self._abort_acquisition = False
+                    return
+                buffer = self.stream.timeout_pop_buffer(self.POLL_TIMEOUT_US)
+                if buffer is None:
+                    # No frame yet: loop round and re-check the abort flag.
+                    print('.', end='')
+                    sys.stdout.flush()
+                    continue
+                try:
+                    status = buffer.get_status()
+                    if status != Aravis.BufferStatus.SUCCESS:
+                        msg = (
+                            f"image {i + 1} of {n_images} received with "
+                            f"buffer status "
+                            f"{getattr(status, 'value_nick', status)!r}"
+                        )
+                        if self.exception_on_failed_shot:
+                            raise RuntimeError(msg)
+                        # Matching IMAQdxCamera: report the bad frame, give up
+                        # on this image, and move on to the next one.
+                        print(msg, file=sys.stderr)
+                        break
+                    images.append(self._buffer_to_array(buffer))
+                finally:
+                    # Reached on every exit from the try, including the raise
+                    # and the break above, so no buffer is ever leaked.
+                    self.stream.push_buffer(buffer)
+                print(f"Got image {i + 1} of {n_images}.")
+                break
+        print(f"Got {len(images)} of {n_images} images.")
+
+    def stop_acquisition(self):
+        """Stop acquisition and release the stream and its buffers.
+
+        self.stream = None happens in a finally so that a raising
+        self.camera.stop_acquisition() (e.g. an unplugged camera) still
+        clears the stream. configure_acquisition() calls stop_acquisition()
+        whenever self.stream is not None, so leaving it set on a raise would
+        make every subsequent configure_acquisition() re-raise the same
+        failure instead of recovering.
+        """
+        try:
+            self.camera.stop_acquisition()
+        finally:
+            # Dropping the stream reference frees its buffers.
+            self.stream = None
+
+    def abort_acquisition(self):
+        """Ask a running grab_multiple to return early. Safe from any thread."""
+        self._abort_acquisition = True
+
+    # ---------------------------------------------------------------- lifecycle
+
+    def close(self):
+        self.stream = None
+        self.device = None
+        self.camera = None
+
+
+class AravisCameraWorker(IMAQdxCameraWorker):
+    """BLACS worker for Aravis cameras.
+
+    All buffered-shot logic, HDF5 output and image transport are inherited;
+    only the camera interface class and the attribute snapshot differ.
+    """
+
+    interface_class = Aravis_Camera
+
+    def get_attributes_as_dict(self, visibility_level):
+        """Return a dict of readable attributes at the given visibility level.
+
+        Overrides the base implementation, which builds this dict with an
+        unguarded comprehension:
+
+            {name: self.camera.get_attribute(name) for name in names}
+
+        Some GenICam features are advertised as readable but raise when
+        actually read outside acquisition. On this FLIR Blackfly S, 26 of the
+        Chunk*/Event* family do exactly that, and they appear at
+        ``'intermediate'`` -- which is the DEFAULT
+        ``saved_attribute_visibility_level``. Since
+        ``transition_to_buffered`` calls this to snapshot attributes into the
+        shot file, the base implementation aborts every buffered shot on a
+        stock configuration.
+
+        No static predicate distinguishes these features: ``is_available``,
+        ``is_implemented`` and the access mode all report them as readable.
+        The only reliable test is to read and skip what fails.
+        """
+        attributes = {}
+        skipped = []
+        for name in self.camera.get_attribute_names(visibility_level):
+            try:
+                attributes[name] = self.camera.get_attribute(name)
+            except Exception:
+                skipped.append(name)
+        if skipped:
+            preview = ', '.join(skipped[:5])
+            suffix = ', ...' if len(skipped) > 5 else ''
+            print(
+                f"Skipped {len(skipped)} attribute(s) that are advertised as "
+                f"readable but raised on read: {preview}{suffix}"
+            )
+        return attributes
+
+    def get_attributes_as_text(self, visibility_level):
+        """Return a string of the camera's *writeable* attributes, formatted
+        for copying and pasting into a connection table's camera_attributes.
+
+        Overrides the base implementation, which lists every readable
+        attribute -- it calls
+        ``self.camera.get_attribute_names(visibility_level)``, whose default
+        ``writeable_only=False`` matches ``get_attribute_names``'s own
+        default. ``IMAQdxCameraWorker``'s docstring says this text is meant
+        to be "appropriate for copying and pasting into your connection
+        table", but on this FLIR Blackfly S, 88 of the 193
+        ``'intermediate'``-visibility names are read-only. Pasting the base
+        output into ``camera_attributes`` makes ``set_attribute`` raise on
+        each read-only name, ``apply_with_retry`` re-raise after the retry
+        pass also fails, and the worker fail inside ``init()`` -- so the tab
+        never starts.
+
+        Restricting to ``writeable_only=True`` keeps the output paste-safe.
+        This does not affect ``get_attributes_as_dict``, which is left as
+        overridden above: the richer read-only data (temperatures, device
+        identity, chunk/event features) is genuinely wanted in the shot
+        file, just not in a dict meant to be pasted back in as input.
+
+        The output format is unchanged from the base implementation; only
+        the set of names differs.
+        """
+        names = self.camera.get_attribute_names(
+            visibility_level, writeable_only=True
+        )
+        attrs = {name: self.camera.get_attribute(name) for name in names}
+        lines = [f'    {repr(key)}: {repr(value)},' for key, value in attrs.items()]
+        dict_repr = '\n'.join(['{'] + lines + ['}'])
+        return self.device_name + '_camera_attributes = ' + dict_repr

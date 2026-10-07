@@ -11,6 +11,8 @@
 
 import time
 import threading
+import queue
+from collections import namedtuple
 from datetime import datetime
 import sys
 import numpy as np
@@ -23,6 +25,41 @@ from labscript_utils import properties
 
 from .ADwin_utils import DAC,ADC
 from . import CLOCK_T12, module_start_index
+
+# libadwin talks to a "TYPE = net" ADwin over one persistent TCP connection
+# (port 6543); the UDP exchange it does first is only the handshake, so the
+# TIMEOUT/COUNT in /etc/adwin/devicelist govern that handshake, not the calls
+# that follow. It reports every transport failure on that connection as error
+# 2001, "Network timeout", including a read that fails immediately because the
+# device already dropped the connection. The elapsed time is what tells the
+# two apart: libadwin sets SO_RCVTIMEO/SO_SNDTIMEO to 5 s on the socket, so a
+# genuine timeout takes about that long, while a dropped connection fails in
+# milliseconds.
+ADWIN_NETWORK_ERROR = 2001
+ADWIN_SOCKET_TIMEOUT = 5.0
+
+TransportVerdict = namedtuple(
+    "TransportVerdict", ["device_reachable", "timed_out", "summary"]
+)
+
+
+def _adwin_call_loop(jobs):
+    """Run submitted callables forever on one thread.
+
+    Exists so that every ADwin call the worker makes off its main thread is
+    made on the *same* thread. libadwin holds the TCP connection to a
+    networked ADwin in thread-local storage, so a new thread means a new
+    connection and nothing ever closes it; a thread per shot fills the
+    device's connection table until it stops answering and has to be
+    power-cycled.
+    """
+    while True:
+        func, result = jobs.get()
+        try:
+            result.put((True, func()))
+        except BaseException as e:  # noqa: BLE001 - handed back to the caller
+            result.put((False, e))
+
 
 class ADwinProIIWorker(Worker):
     RAISE_EXCEPTIONS = 1
@@ -64,7 +101,18 @@ class ADwinProIIWorker(Worker):
             BTL = self.adw.ADwindir + "adwin12.btl"
         elif sys.platform == "linux":
             BTL = self.adw.ADwindir + "share/btl/adwin12.btl"
-        self.adw.Boot(BTL)
+        boot_start = time.perf_counter()
+        try:
+            self.adw.Boot(BTL)
+        except Exception as e:
+            # A tab restart after a lost session comes straight back here, and
+            # Boot reports the same misleading 2001. Record whether the device
+            # is answering at all before giving up.
+            if getattr(e, "errorNumber", None) == ADWIN_NETWORK_ERROR:
+                self._diagnose_transport_failure(
+                    "Boot", time.perf_counter() - boot_start
+                )
+            raise
         if self.adw.Test_Version():
             raise LabscriptError("Testing Version failed after booting ADwin")
         print("DONE")
@@ -217,39 +265,55 @@ class ADwinProIIWorker(Worker):
         adwin_data = {}
         exc_box = [None]
 
+        call_start = time.perf_counter()
+
+        def _timed(fn, *args):
+            """Run one ADwin call, remembering when it started.
+
+            How long the *failing* call took is what distinguishes a real
+            timeout from a connection that was already broken, so the start has
+            to be per call rather than per block.
+            """
+            nonlocal call_start
+            call_start = time.perf_counter()
+            return fn(*args)
+
         def _adwin_calls():
             try:
                 if AI_count > 0:
                     adwin_data['AIN'] = np.ctypeslib.as_array(
-                        self.adw.GetData_Long(199, 1, AI_count)
+                        _timed(self.adw.GetData_Long, 199, 1, AI_count)
                     ).astype(np.uint16)
                 if has_waits:
-                    adwin_data['wait_duration'] = self.adw.Get_Par(4) / CLOCK_T12 * self.PROCESSDELAY
+                    adwin_data['wait_duration'] = _timed(self.adw.Get_Par, 4) / CLOCK_T12 * self.PROCESSDELAY
                 # Check if the TiCo processes were running correctly
                 for name, num in self.DIO_ADwin_DataNo:
                     if num == 50: # TODO: Fix in Adbasic
                         num = 20
-                    if not self.adw.Get_Par(num) == 1:
+                    if not _timed(self.adw.Get_Par, num) == 1:
                         exc_box[0] = LabscriptError(
                             f"TiCo process of module {name} was not running before at end main process."
                         )
                         return
                 # Stop buffered and start manual process in ADwin
-                self.adw.Stop_Process(self.process_number_buffered)
+                _timed(self.adw.Stop_Process, self.process_number_buffered)
                 #self.adw.Start_Process(self.process_number_manual)
             except Exception as e:
+                # These are the first ADwin calls after the shot ends, and the
+                # point where a dropped TCP session shows up as a misleading
+                # 2001 "Network timeout". Record what actually broke before the
+                # error propagates and BLACS tears the tab down.
+                if getattr(e, "errorNumber", None) == ADWIN_NETWORK_ERROR:
+                    self._diagnose_transport_failure(
+                        f"{type(e).__name__} in transition_to_manual",
+                        time.perf_counter() - call_start,
+                    )
                 exc_box[0] = e
 
         _TIMEOUT = 30  # seconds; normal ADwin calls finish in <1 s
-        t = threading.Thread(target=_adwin_calls, daemon=True)
-        t.start()
-        t.join(_TIMEOUT)
-        if t.is_alive():
-            # The orphaned thread holds no file lock, so BLACS can recover safely.
-            raise LabscriptError(
-                f"ADwin transition_to_manual timed out after {_TIMEOUT} s — "
-                "hardware communication is hung. Restart BLACS to recover."
-            )
+        # One long-lived thread, not one per shot: a fresh thread would make
+        # libadwin open another TCP connection to the ADwin and never close it.
+        self._submit_adwin_call(_adwin_calls, _TIMEOUT)
         if exc_box[0] is not None:
             raise exc_box[0]
 
@@ -348,6 +412,109 @@ class ADwinProIIWorker(Worker):
             for port in inputs:
                 inputs[port] = values[port-1]
         return AIN_values
+
+
+    def _submit_adwin_call(self, func, timeout):
+        """Run `func` on the worker's dedicated ADwin thread and wait for it.
+
+        Calls are made off the worker's main thread so that a hung ADwin
+        cannot freeze BLACS, but they all go to one long-lived thread rather
+        than a fresh thread each time: see _adwin_call_loop for why that
+        matters.
+
+        Raises whatever `func` raised, or LabscriptError if it did not finish
+        within `timeout`. On timeout the stuck thread is abandoned (costing
+        the one connection it holds) and the next call starts a new one, so a
+        single hang does not wedge the worker permanently.
+        """
+        if getattr(self, "_adwin_thread", None) is None or not self._adwin_thread.is_alive():
+            self._adwin_jobs = queue.Queue()
+            self._adwin_thread = threading.Thread(
+                target=_adwin_call_loop, args=(self._adwin_jobs,), daemon=True
+            )
+            self._adwin_thread.start()
+
+        result = queue.Queue(1)
+        self._adwin_jobs.put((func, result))
+        try:
+            succeeded, value = result.get(timeout=timeout)
+        except queue.Empty:
+            # The thread is still inside a hung ADwin call and cannot be
+            # reused. Drop it; it holds no file lock, so BLACS can recover.
+            self._adwin_thread = None
+            self._adwin_jobs = None
+            raise LabscriptError(
+                f"ADwin call timed out after {timeout} s — hardware "
+                "communication is hung. Restart BLACS to recover."
+            )
+        if succeeded:
+            return value
+        raise value
+
+
+    def _diagnose_transport_failure(self, during, elapsed):
+        """Say whether a 2001 was our TCP session breaking or the device dying.
+
+        The probe opens a second session *on its own thread*. That matters:
+        libadwin keeps the connection in thread-local storage, so a new
+        ADwin() object on this thread would silently reuse the connection that
+        just failed and the probe would always report the device as dead. The
+        probe thread costs one connection, which is acceptable on a path that
+        has already lost the shot.
+
+        If the probe works the device is alive and only one connection was
+        lost; if it fails too, the device itself is not answering.
+
+        Runs on the failure path, so it swallows everything and never raises --
+        the caller re-raises the original ADwinError.
+
+        Note this shares ADwin.__err (a class attribute on the ADwin class,
+        which the Python wrapper never clears) with self.adw, so call it only
+        when the current session is already being abandoned.
+        """
+        timed_out = elapsed >= ADWIN_SOCKET_TIMEOUT * 0.9
+        kind = (
+            f"waited {elapsed:.1f}s, consistent with the {ADWIN_SOCKET_TIMEOUT:.0f}s "
+            "socket timeout"
+            if timed_out
+            else f"failed after only {elapsed*1e3:.0f}ms, so libadwin was not waiting: "
+            "the TCP connection was already broken"
+        )
+        probe_result = []
+
+        def _probe():
+            try:
+                probe = ADwin.ADwin(self.device_no, self.RAISE_EXCEPTIONS)
+                probe_result.append(probe.Test_Version() == 0)
+            except Exception as e:
+                probe_result.append(False)
+                probe_result.append(str(e))
+
+        # Bounded: the device may accept the connection and then never answer.
+        t = threading.Thread(target=_probe, daemon=True)
+        t.start()
+        t.join(ADWIN_SOCKET_TIMEOUT * 2)
+        if not probe_result:
+            reachable = False
+            kind += "; a fresh session on a new connection did not answer either"
+        else:
+            reachable = probe_result[0]
+            if len(probe_result) > 1:
+                kind += f"; opening a fresh connection also failed ({probe_result[1]})"
+
+        if reachable:
+            summary = (
+                f"{during} failed but the device answered a new session: only this "
+                f"worker's TCP session was dropped ({kind})"
+            )
+        else:
+            summary = (
+                f"{during} failed and the device did not answer a new session "
+                f"either: the ADwin itself is unreachable ({kind})"
+            )
+        self.logger.error("ADwin transport failure: %s", summary)
+        print(f"ADwin transport failure: {summary}")
+        return TransportVerdict(reachable, timed_out, summary)
 
 
     def shutdown(self):
